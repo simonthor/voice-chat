@@ -1,0 +1,5 @@
+{
+  "name": "voice",
+  "version": "0.1.0",
+  "description": "Voice-friendly output for hands-free Claude Code sessions run by voice-chat."
+}

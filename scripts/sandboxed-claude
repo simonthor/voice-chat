@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Claude Code inside the bwrap sandbox from ~/Code/sandbox. voice-chat passes
+# this as the Agent SDK's cli_path; the SDK talks to it over stdin/stdout,
+# which pass through bwrap. The current directory (the SDK's cwd) becomes the
+# sandbox's writable root, and --die-with-parent ends it with voice-chat.
+exec "${SANDBOX_DIR:-$HOME/Code/sandbox}/sandbox-shell" claude "$@"
