@@ -3,6 +3,8 @@ name = "voice-chat"
 version = "0.1.0"
 description = "Hands-free Claude Code with headphone buttons, Whisper and Piper"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Simon Thor", email = "simon11.thor@hotmail.se" }
 ]

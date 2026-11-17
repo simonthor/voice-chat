@@ -8,12 +8,17 @@ Gestures (Sony WH-1000XM4 over AVRCP):
 A recording ends by itself after a pause in speech (endpointing): while the mic
 is open the headphones are in the headset (HFP) profile, in which they send no
 button events at all.
+
+Saying "slash clear", "slash effort <level>" or "slash model <name>" runs that
+Claude Code command; "slash resume" lists recent sessions to continue.
 """
 
 import argparse
 import asyncio
+import re
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -28,9 +33,9 @@ from claude_agent_sdk import (
     TextBlock,
     ToolPermissionContext,
     ToolUseBlock,
+    list_sessions,
 )
 from evdev import InputDevice, UInput, ecodes, list_devices
-
 from faster_whisper.vad import get_speech_timestamps
 
 from voice_chat.audio import MIC_RATE, Recorder, Speaker, load_whisper
@@ -47,6 +52,20 @@ SYSTEM_PROMPT_APPEND = (
     "text-to-speech through the user's headphones, and the user's messages are "
     "speech-to-text transcripts. Follow the voice:voice-output skill for every reply."
 )
+# A spoken slash command, as Whisper writes it: "Slash model, Opus." or "/clear".
+SLASH_COMMAND = re.compile(
+    r"(?:slash\s*|/)(clear|effort|model|resume)\b\W*(.*?)\W*", re.IGNORECASE
+)
+NUMBERS = {
+    "one": 1,
+    "two": 2,
+    "to": 2,
+    "too": 2,
+    "three": 3,
+    "four": 4,
+    "for": 4,
+    "five": 5,
+}
 
 
 async def read_buttons(gestures: asyncio.Queue[int]) -> None:
@@ -100,15 +119,35 @@ class VoiceChat:
         self.approval: asyncio.Future[bool] | None = None  # waiting for allow/deny
         self.answer: asyncio.Future[str] | None = None  # waiting for a spoken answer
         self.last_reply = ""
+        self.session_id: str | None = None  # the current Claude Code session
+        self.session_ids: set[str] = set()  # every session this run wrote to
+        self.options: ClaudeAgentOptions
         self.client: ClaudeSDKClient
 
     async def run(self, options: ClaudeAgentOptions) -> None:
-        async with ClaudeSDKClient(options=options) as self.client:
+        self.options = options
+        self.client = ClaudeSDKClient(options=options)
+        await self.client.connect()
+        try:
             # Claude only loads a skill when it judges it relevant, so load it
             # explicitly; the reply to this doubles as the "ready" message.
             self.turn = asyncio.create_task(self.run_turn("/voice:voice-output"))
             while True:
                 await self.on_gesture(await self.gestures.get())
+        finally:
+            await self.client.disconnect()
+            # The /resume picker of interactive Claude Code hides sessions
+            # whose entrypoint is the SDK's, and the CLI can't be told to
+            # record another one, so relabel them once the CLI has exited.
+            for session_id in self.session_ids:
+                for path in (Path.home() / ".claude/projects").glob(
+                    f"*/{session_id}.jsonl"
+                ):
+                    path.write_text(
+                        path.read_text().replace(
+                            '"entrypoint":"sdk-py"', '"entrypoint":"cli"'
+                        )
+                    )
 
     async def on_gesture(self, gesture: int) -> None:
         if self.recording is not None:
@@ -137,7 +176,17 @@ class VoiceChat:
             else:
                 if self.turn is not None:
                     await self.turn  # interrupted when the recording started
-                self.turn = asyncio.create_task(self.run_turn(text))
+                command = SLASH_COMMAND.fullmatch(text)
+                if command is None:
+                    self.turn = asyncio.create_task(self.run_turn(text))
+                elif command[1].lower() == "resume":
+                    self.turn = asyncio.create_task(self.resume())
+                else:
+                    argument = " ".join(re.findall(r"\w+", command[2].lower()))
+                    argument = re.sub(r"\b(?:extra|x) high\b", "xhigh", argument)
+                    prompt = f"/{command[1].lower()} {argument}".strip()
+                    print(f"command: {prompt}")
+                    self.turn = asyncio.create_task(self.run_turn(prompt))
             return
 
         if self.approval is not None:
@@ -197,15 +246,62 @@ class VoiceChat:
                         elif isinstance(block, ToolUseBlock):
                             print(f"[{block.name}]")
                             self.speaker.tone(1200, seconds=0.04, volume=0.1)
-                elif isinstance(message, ResultMessage) and message.is_error:
-                    print(f"error: {message.subtype} {message.errors}")
-                    self.speaker.say("Something went wrong, see the terminal.")
+                elif isinstance(message, ResultMessage):
+                    self.session_id = message.session_id
+                    self.session_ids.add(message.session_id)
+                    if message.is_error:
+                        print(f"error: {message.subtype} {message.errors}")
+                        self.speaker.say("Something went wrong, see the terminal.")
         except Exception as error:  # noqa: BLE001 -- report it by voice, keep the session
             print(f"error: {error!r}")
             self.speaker.say("Something went wrong, see the terminal.")
         self.last_reply = "\n".join(reply)
         self.speaker.tone(520, seconds=0.08)
         self.speaker.tone(780, seconds=0.12)
+        if prompt == "/clear":  # a new session, which hasn't loaded the skill
+            await self.run_turn("/voice:voice-output")
+
+    async def resume(self) -> None:
+        """Read out the recent sessions of this project (including ones from
+        interactive Claude Code), and continue the one the user names."""
+        sessions = [
+            session
+            for session in list_sessions(directory=str(self.options.cwd), limit=6)
+            if session.session_id != self.session_id
+        ][:5]
+        if not sessions:
+            self.speaker.say("There are no other sessions to resume.")
+            return
+        options = " ".join(
+            f"Option {i}: {session.summary[:100]}."
+            for i, session in enumerate(sessions, start=1)
+        )
+        self.speaker.say(f"Which session? {options} Swipe forward and say the number.")
+        self.answer = asyncio.get_running_loop().create_future()
+        answer = await self.answer
+        self.answer = None
+        number = next(
+            (
+                int(word) if word.isdigit() else NUMBERS[word]
+                for word in re.findall(r"\w+", answer.lower())
+                if word.isdigit() or word in NUMBERS
+            ),
+            0,
+        )
+        if not 1 <= number <= len(sessions):
+            self.speaker.say("Okay, staying in this session.")
+            return
+        session = sessions[number - 1]
+        print(f"resuming {session.session_id}: {session.summary}")
+        # Connect before dropping the old client, so a swipe in between still
+        # has a connected client to interrupt.
+        client = ClaudeSDKClient(
+            options=replace(self.options, resume=session.session_id)
+        )
+        await client.connect()
+        await self.client.disconnect()
+        self.client = client
+        await self.run_turn("/voice:voice-output")
 
     async def can_use_tool(
         self, tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
@@ -275,6 +371,8 @@ async def amain(args: argparse.Namespace) -> None:
             "append": SYSTEM_PROMPT_APPEND,
         },
         setting_sources=["user", "project", "local"],
+        # Under the SDK, Claude Code ignores defaultMode from the settings files.
+        permission_mode=args.permission_mode,
         can_use_tool=chat.can_use_tool,
         # Pipe Claude Code's stderr so it doesn't write into our terminal; shown with --debug.
         stderr=lambda line: print(line, file=sys.stderr) if args.debug else None,
@@ -294,6 +392,18 @@ def main() -> None:
     )
     parser.add_argument("--whisper-model", default="distil-large-v3")
     parser.add_argument("--voice", default="en_US-lessac-high", help="Piper voice name")
+    parser.add_argument(
+        "--permission-mode",
+        default="auto",
+        choices=[
+            "default",
+            "acceptEdits",
+            "plan",
+            "auto",
+            "dontAsk",
+            "bypassPermissions",
+        ],
+    )
     parser.add_argument(
         "--debug", action="store_true", help="show Claude Code's stderr"
     )
